@@ -28,7 +28,7 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '1mb' }));
 
-// Trust Nginx reverse proxy (important for GCE + Nginx setup)
+// Trust Nginx reverse proxy
 app.set('trust proxy', 1);
 
 // ─── SUPABASE ────────────────────────────────────────────────────────────────
@@ -37,20 +37,14 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_KEY) {
   supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false },
     global: {
-      fetch: (url, options = {}) =>
-        fetch(url, { ...options, timeout: 8000 }),
+      fetch: (url, options = {}) => fetch(url, { ...options, timeout: 8000 }),
     },
   });
 }
 
-// ─── PUPPETEER SETUP ─────────────────────────────────────────────────────────
+// ─── PUPPETEER ───────────────────────────────────────────────────────────────
 puppeteer.use(AdblockerPlugin({ blockTrackers: true }));
 
-/**
- * IMPROVEMENT #1 — Persistent Browser Pool
- * Instead of launching a new browser per request (slow, ~2-3s overhead),
- * we keep one warm browser alive and reuse it. If it crashes, we relaunch.
- */
 const BROWSER_ARGS = [
   '--no-sandbox',
   '--disable-setuid-sandbox',
@@ -66,17 +60,14 @@ const BROWSER_ARGS = [
   '--window-size=1280,720',
 ];
 
-// Path to Chrome on GCE VM after setup.sh runs
 const CHROME_PATH = process.env.CHROME_BIN || '/usr/bin/google-chrome-stable';
 
-let _browser      = null;
-let _browserBusy  = false; // simple semaphore for single concurrent scrape
-let _launchLock   = null;
+let _browser     = null;
+let _browserBusy = false;
+let _launchLock  = null;
 
 async function getBrowser() {
   if (_browser && _browser.isConnected()) return _browser;
-
-  // Only one launch at a time
   if (_launchLock) return _launchLock;
 
   _launchLock = (async () => {
@@ -103,19 +94,29 @@ async function getBrowser() {
   return _launchLock;
 }
 
-// Warm the browser on startup so the first user request is fast
+// Warm the browser on startup
 getBrowser().catch((e) => console.error('[browser] Warm-up failed:', e.message));
 
 // ─── OPENSUBTITLES TOKEN CACHE ───────────────────────────────────────────────
 let _osTokenCache   = { token: null, expiresAt: 0 };
 let _osTokenPending = null;
 
+const OS_BASE = 'https://api.opensubtitles.com/api/v1';
+
+function buildOsHeaders() {
+  return {
+    'Api-Key':      process.env.OPENSUBTITLES_API_KEY,
+    'Content-Type': 'application/json',
+    'Accept':       'application/json',
+    'User-Agent':   process.env.OPENSUBTITLES_USER_AGENT || 'StreamApp v1.0',
+  };
+}
+
 async function getOsToken(osHeaders) {
   const now = Date.now();
   if (_osTokenCache.token && now < _osTokenCache.expiresAt) return _osTokenCache.token;
   if (_osTokenPending) return _osTokenPending;
 
-  const OS_BASE = 'https://api.opensubtitles.com/api/v1';
   _osTokenPending = fetch(`${OS_BASE}/login`, {
     method:  'POST',
     headers: osHeaders,
@@ -129,8 +130,15 @@ async function getOsToken(osHeaders) {
       if (data.token) {
         _osTokenCache.token     = data.token;
         _osTokenCache.expiresAt = Date.now() + 55 * 60 * 1000;
+        console.log('[subs] OpenSubtitles token refreshed.');
+      } else {
+        console.error('[subs] OpenSubtitles login failed:', JSON.stringify(data));
       }
       return data.token || null;
+    })
+    .catch((err) => {
+      console.error('[subs] OpenSubtitles token fetch error:', err.message);
+      return null;
     })
     .finally(() => { _osTokenPending = null; });
 
@@ -155,10 +163,9 @@ async function fetchWithRetry(url, options, retries = 2) {
   }
 }
 
-// ─── IMPROVEMENT #2 — In-Process URL Rewrite Cache ──────────────────────────
-// Avoid re-fetching + re-parsing the same m3u8 playlist within a short window.
-const _playlistCache = new Map(); // url → { text, expiresAt }
-const PLAYLIST_TTL   = 30_000;   // 30 seconds
+// ─── IN-PROCESS PLAYLIST CACHE ───────────────────────────────────────────────
+const _playlistCache = new Map();
+const PLAYLIST_TTL   = 30_000;
 
 function getCachedPlaylist(url) {
   const entry = _playlistCache.get(url);
@@ -168,7 +175,6 @@ function getCachedPlaylist(url) {
 }
 function setCachedPlaylist(url, text) {
   _playlistCache.set(url, { text, expiresAt: Date.now() + PLAYLIST_TTL });
-  // Evict old entries if cache grows too large
   if (_playlistCache.size > 200) {
     const firstKey = _playlistCache.keys().next().value;
     _playlistCache.delete(firstKey);
@@ -228,8 +234,8 @@ app.get('/api/proxy', async (req, res) => {
       'Referer':    'https://vidlink.pro/',
       'Origin':     'https://vidlink.pro/',
     };
-    if (cookieString)        forwardedHeaders['Cookie'] = cookieString;
-    if (req.headers.range)   forwardedHeaders['Range']  = req.headers.range;
+    if (cookieString)      forwardedHeaders['Cookie'] = cookieString;
+    if (req.headers.range) forwardedHeaders['Range']  = req.headers.range;
     delete forwardedHeaders['accept-encoding'];
 
     const response = await fetchWithRetry(targetUrl, {
@@ -243,7 +249,15 @@ app.get('/api/proxy', async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
 
     const contentType = response.headers.get('content-type') || '';
-    res.setHeader('Content-Type', req.query.type === 'sub' ? 'text/vtt' : contentType);
+
+    // ── Subtitle content-type fix ──────────────────────────────────────────
+    // Forces text/vtt so browsers render subtitle tracks correctly regardless
+    // of what the upstream server returns (often text/plain or octet-stream).
+    if (req.query.type === 'sub') {
+      res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
+    } else {
+      res.setHeader('Content-Type', contentType);
+    }
 
     if (response.headers.get('content-range'))  res.setHeader('Content-Range',  response.headers.get('content-range'));
     if (response.headers.get('accept-ranges'))  res.setHeader('Accept-Ranges',  response.headers.get('accept-ranges'));
@@ -256,13 +270,13 @@ app.get('/api/proxy', async (req, res) => {
       res.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=3600, stale-while-revalidate=600');
     }
 
+    // ── M3U8 playlist rewriting ────────────────────────────────────────────
     if (isPlaylist) {
-      // Check in-process playlist cache first
       const cached = getCachedPlaylist(targetUrl);
       let rewritten = cached;
 
       if (!rewritten) {
-        const text        = await response.text();
+        const text         = await response.text();
         const providerBase = new URL(targetUrl).origin + new URL(targetUrl).pathname.replace(/[^/]+$/, '');
         const lines        = text.split('\n');
         rewritten          = '';
@@ -277,9 +291,9 @@ app.get('/api/proxy', async (req, res) => {
           } else if (line.startsWith('#EXT-X-MEDIA') && (line.includes('TYPE=AUDIO') || line.includes('TYPE=SUBTITLES'))) {
             const uriMatch = line.match(/URI\s*=\s*(["']?)([^"'\s]+)\1/);
             if (uriMatch) {
-              const uri        = uriMatch[2];
-              const absUri     = uri.startsWith('http') ? uri : new URL(uri, providerBase).href;
-              const proxyUri   = key
+              const uri      = uriMatch[2];
+              const absUri   = uri.startsWith('http') ? uri : new URL(uri, providerBase).href;
+              const proxyUri = key
                 ? `/api/proxy?url=${encodeURIComponent(absUri)}&key=${encodeURIComponent(key)}`
                 : `/api/proxy?url=${encodeURIComponent(absUri)}`;
               line = line.replace(uriMatch[0], `URI="${proxyUri}"`);
@@ -295,7 +309,7 @@ app.get('/api/proxy', async (req, res) => {
       return res.send(rewritten);
     }
 
-    // Stream piping
+    // ── Binary / segment streaming ─────────────────────────────────────────
     res.on('error', () => {});
     response.body.on('error', (err) => {
       if (!res.destroyed && !res.headersSent) res.status(502).end();
@@ -318,15 +332,10 @@ app.get('/api/proxy', async (req, res) => {
 });
 
 // ─── 2. SCRAPE-STREAM ROUTE ──────────────────────────────────────────────────
-/**
- * IMPROVEMENT #3 — Reuse the persistent browser, open only a new page.
- * This cuts ~2-3 seconds of cold-launch time from every scrape request.
- */
 app.post('/api/scrape-stream', async (req, res) => {
   const encryptedPayload = req.body.data;
   if (!encryptedPayload) return res.status(400).json({ error: 'Invalid request payload.' });
 
-  // Prevent concurrent scrapes from overwhelming Chrome
   if (_browserBusy) {
     return res.status(429).json({ error: 'Scraper is busy, please retry in a moment.' });
   }
@@ -345,7 +354,6 @@ app.post('/api/scrape-stream', async (req, res) => {
 
     const cacheKey = `${id}-${type}-${s || ''}-${e || ''}`;
 
-    // Cache check
     const { data: cacheData, error: cacheError } = await supabase
       .from('streams')
       .select('url, expires_at')
@@ -360,10 +368,8 @@ app.post('/api/scrape-stream', async (req, res) => {
       return res.json({ success: true, url: `/api/proxy?key=${encodeURIComponent(cacheKey)}` });
     }
 
-    // Launch / reuse persistent browser
-    const browser  = await getBrowser();
-    page           = await browser.newPage();
-
+    const browser = await getBrowser();
+    page          = await browser.newPage();
     await page.setRequestInterception(true);
 
     let capturedUrl = null;
@@ -387,7 +393,6 @@ app.post('/api/scrape-stream', async (req, res) => {
     await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.mouse.click(640, 360).catch(() => {});
 
-    // IMPROVEMENT #4 — Wait for URL with smarter polling (no fixed 30s loop)
     capturedUrl = await new Promise((resolve) => {
       const check = setInterval(() => {
         if (capturedUrl) { clearInterval(check); resolve(capturedUrl); }
@@ -421,9 +426,14 @@ app.post('/api/scrape-stream', async (req, res) => {
 });
 
 // ─── 3. SUBTITLES ROUTE ──────────────────────────────────────────────────────
+// Full OpenSubtitles integration:
+//   • Token caching (55-min TTL, single in-flight lock)
+//   • TV episode specificity (season + episode params)
+//   • Deduplication by language, skip multi-CD releases
+//   • All downloads proxied through /api/proxy?type=sub so the browser
+//     receives the correct text/vtt CORS headers regardless of OS CDN headers
+//   • Promise.allSettled so one failed download doesn't kill the rest
 app.post('/api/subs', async (req, res) => {
-  const OS_BASE = 'https://api.opensubtitles.com/api/v1';
-
   try {
     const encryptedPayload = req.body.data;
     if (!encryptedPayload) return res.status(400).json({ error: 'Invalid request payload.' });
@@ -433,20 +443,22 @@ app.post('/api/subs', async (req, res) => {
     if (!decryptedString) return res.status(400).json({ error: 'Invalid request payload.' });
 
     const { imdbId, type, season, episode } = JSON.parse(decryptedString);
+    if (!imdbId) return res.status(400).json({ error: 'Missing imdbId.' });
 
     const subsController = new AbortController();
-    const subsTimeoutId  = setTimeout(() => subsController.abort(), 8000);
+    const subsTimeoutId  = setTimeout(() => subsController.abort(), 10000);
 
-    const osHeaders = {
-      'Api-Key':      process.env.OPENSUBTITLES_API_KEY,
-      'Content-Type': 'application/json',
-      'Accept':       'application/json',
-      'User-Agent':   process.env.OPENSUBTITLES_USER_AGENT,
-    };
+    const osHeaders = buildOsHeaders();
 
+    // ── Token auth ────────────────────────────────────────────────────────
     const token = await getOsToken(osHeaders);
-    if (token) osHeaders['Authorization'] = `Bearer ${token}`;
+    if (token) {
+      osHeaders['Authorization'] = `Bearer ${token}`;
+    } else {
+      console.warn('[subs] Proceeding without Bearer token (API-key only).');
+    }
 
+    // ── Search params ─────────────────────────────────────────────────────
     const params = new URLSearchParams({
       tmdb_id:         imdbId,
       languages:       'en',
@@ -454,23 +466,38 @@ app.post('/api/subs', async (req, res) => {
       order_direction: 'desc',
     });
 
+    // TV episode specificity — without these params OS returns season packs
+    // which are multi-CD and get filtered out, leaving no subtitles for TV.
     if (type === 'tv' && season && episode) {
-      params.append('season_number', season);
-      params.append('episode_number', episode);
+      params.append('season_number',  String(season));
+      params.append('episode_number', String(episode));
       params.append('type', 'episode');
     } else {
       params.append('type', 'movie');
     }
 
-    const searchRes  = await fetch(`${OS_BASE}/subtitles?${params.toString()}`, {
+    console.log(`[subs] Searching: type=${type} id=${imdbId} s=${season} e=${episode}`);
+
+    const searchRes = await fetch(`${OS_BASE}/subtitles?${params.toString()}`, {
       headers: osHeaders,
       signal:  subsController.signal,
     });
-    const searchData = await searchRes.json();
 
+    if (!searchRes.ok) {
+      const errText = await searchRes.text();
+      console.error('[subs] Search failed:', searchRes.status, errText);
+      clearTimeout(subsTimeoutId);
+      return res.status(502).json({ error: 'Subtitle search failed.' });
+    }
+
+    const searchData = await searchRes.json();
+    console.log(`[subs] Results: ${searchData.data?.length ?? 0} found`);
+
+    // ── Pick best subtitle per language ───────────────────────────────────
     let tracksToDownload = [];
     if (searchData.data?.length > 0) {
-      const sorted = searchData.data.sort((a, b) => {
+      const sorted = [...searchData.data].sort((a, b) => {
+        // Trusted uploaders first, then highest download count
         const aT = a.attributes.from_trusted ? 1 : 0;
         const bT = b.attributes.from_trusted ? 1 : 0;
         if (bT !== aT) return bT - aT;
@@ -481,7 +508,10 @@ app.post('/api/subs', async (req, res) => {
       for (const item of sorted) {
         const attrs = item.attributes;
         const lang  = attrs.language;
+
+        // Skip: already seen this language, multi-CD packs, or no files
         if (seenLanguages.has(lang) || attrs.nb_cd > 1 || !attrs.files?.length) continue;
+
         tracksToDownload.push({
           title:    attrs.language_name || lang.toUpperCase() || 'Unknown',
           language: lang || 'en',
@@ -492,17 +522,33 @@ app.post('/api/subs', async (req, res) => {
       }
     }
 
-    // IMPROVEMENT #5 — Parallel subtitle downloads with Promise.allSettled
+    console.log(`[subs] Downloading ${tracksToDownload.length} subtitle file(s)`);
+
+    // ── Download + proxy-wrap each subtitle ───────────────────────────────
     const downloadResults = await Promise.allSettled(
       tracksToDownload.map(async (track) => {
-        const dlRes  = await fetch(`${OS_BASE}/download`, {
+        const dlRes = await fetch(`${OS_BASE}/download`, {
           method:  'POST',
           headers: osHeaders,
           body:    JSON.stringify({ file_id: track.fileId }),
           signal:  subsController.signal,
         });
+
+        if (!dlRes.ok) {
+          console.warn(`[subs] Download failed for fileId ${track.fileId}: ${dlRes.status}`);
+          return null;
+        }
+
         const dlData = await dlRes.json();
-        if (!dlData.link) return null;
+        if (!dlData.link) {
+          console.warn(`[subs] No link returned for fileId ${track.fileId}`);
+          return null;
+        }
+
+        // Proxy the subtitle URL so the browser gets:
+        //   Content-Type: text/vtt; charset=utf-8
+        //   Access-Control-Allow-Origin: *
+        // regardless of what OpenSubtitles CDN returns.
         return {
           title:    track.title,
           language: track.language,
@@ -514,8 +560,10 @@ app.post('/api/subs', async (req, res) => {
     clearTimeout(subsTimeoutId);
 
     const finalTracks = downloadResults
-      .filter((r) => r.status === 'fulfilled' && r.value)
+      .filter((r) => r.status === 'fulfilled' && r.value !== null)
       .map((r) => r.value);
+
+    console.log(`[subs] Returning ${finalTracks.length} track(s)`);
 
     const encryptedResponse = CryptoJS.AES.encrypt(
       JSON.stringify({ tracks: finalTracks }),
@@ -526,7 +574,7 @@ app.post('/api/subs', async (req, res) => {
 
   } catch (error) {
     if (error.name === 'AbortError') {
-      return res.status(504).json({ error: 'Service temporarily unavailable.' });
+      return res.status(504).json({ error: 'Subtitle service timed out.' });
     }
     console.error('[subs]', error.message);
     res.status(500).json({ error: 'An unexpected server error occurred.' });
@@ -537,18 +585,23 @@ app.post('/api/subs', async (req, res) => {
 app.post('/api/save-progress',    async (req, res) => res.json({ success: !!supabase }));
 app.post('/api/add-to-watchlist', async (req, res) => res.json({ success: !!supabase }));
 
-// ─── 5. HEALTH CHECK (for GCE auto-healing / load balancer) ─────────────────
+// ─── 5. HEALTH CHECK ─────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   res.status(200).json({
-    status:  'ok',
-    browser: _browser?.isConnected() ? 'connected' : 'disconnected',
-    uptime:  process.uptime(),
+    status:      'ok',
+    browser:     _browser?.isConnected() ? 'connected' : 'disconnected',
+    osToken:     !!_osTokenCache.token,
+    osTokenExp:  _osTokenCache.token
+      ? new Date(_osTokenCache.expiresAt).toISOString()
+      : null,
+    supabase:    !!supabase,
+    uptime:      Math.floor(process.uptime()),
   });
 });
 
 // ─── 6. STATIC FRONTEND ──────────────────────────────────────────────────────
 app.use(express.static(path.join(__dirname, '../dist'), {
-  maxAge: '1d',        // Cache static assets for 1 day in the browser
+  maxAge: '1d',
   etag:   true,
 }));
 
@@ -556,18 +609,16 @@ app.get(/^\/(?!api).*/, (req, res) => {
   res.sendFile(path.join(__dirname, '../dist/index.html'));
 });
 
-// ─── START SERVER ────────────────────────────────────────────────────────────
+// ─── START ───────────────────────────────────────────────────────────────────
 const server = createServer(app);
 
-// Keep connections alive longer — important behind Nginx
-server.keepAliveTimeout    = 65_000;
-server.headersTimeout      = 66_000;
+server.keepAliveTimeout = 65_000;
+server.headersTimeout   = 66_000;
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Server running on port ${PORT} | PID: ${process.pid}`);
 });
 
-// Graceful shutdown — close browser cleanly when PM2 restarts
 process.on('SIGTERM', async () => {
   console.log('[shutdown] SIGTERM received. Closing gracefully…');
   server.close(() => process.exit(0));
